@@ -144,7 +144,6 @@
 
   .main { display: flex; flex: 1; overflow: hidden; }
 
-  /* SIDEBAR RESPONSIVE */
   .sidebar {
     width: 460px;
     flex-shrink: 0;
@@ -387,10 +386,16 @@
 
 <header>
   <div class="logo">sono.</div>
-  <button class="brutal-btn" onclick="document.getElementById('folderInput').click()">
+  <button class="brutal-btn" onclick="openFolderPicker()">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
     ouvrir un dossier
   </button>
+  
+  <button class="brutal-btn" id="restoreBtn" style="display: none; background: var(--accent); color: var(--bg);" onclick="restoreSession()">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
+    restaurer
+  </button>
+
   <div class="search-wrap">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
     <input type="text" id="searchInput" class="brutal-input" placeholder="rechercher..." oninput="applyFiltersAndSearch()">
@@ -486,7 +491,8 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
         <h2>aucun son charge</h2>
         <p>ouvre un dossier contenant tes fichiers audio pour commencer a ecouter</p>
-        <button class="brutal-btn" style="margin-top: 24px;" onclick="document.getElementById('folderInput').click()">ouvrir un dossier</button>
+        <button class="brutal-btn" style="margin-top: 24px;" onclick="openFolderPicker()">ouvrir un dossier</button>
+        <button class="brutal-btn" id="emptyRestoreBtn" style="margin-top: 12px; display: none; background: var(--accent); color: var(--bg);" onclick="restoreSession()">restaurer la derniere playlist</button>
       </div>
     </div>
   </div>
@@ -840,25 +846,189 @@ audio.addEventListener('timeupdate', updateProgress);
 audio.addEventListener('ended', onTrackEnd);
 audio.addEventListener('loadedmetadata', () => { document.getElementById('totalTime').textContent = fmt(audio.duration); });
 
+const dbPromise = new Promise((resolve, reject) => {
+  const req = indexedDB.open('SonoDB', 1);
+  req.onupgradeneeded = e => {
+    const db = e.target.result;
+    if (!db.objectStoreNames.contains('tracks')) db.createObjectStore('tracks', { keyPath: 'id' });
+    if (!db.objectStoreNames.contains('settings')) db.createObjectStore('settings', { keyPath: 'id' });
+  };
+  req.onsuccess = e => resolve(e.target.result);
+  req.onerror = e => reject(e);
+});
+
+async function saveDirectoryHandle(handle) {
+  const db = await dbPromise;
+  const tx = db.transaction('settings', 'readwrite');
+  tx.objectStore('settings').put({ id: 'last_dir', handle });
+}
+
+async function getDirectoryHandle() {
+  const db = await dbPromise;
+  return new Promise(r => {
+    const tx = db.transaction('settings', 'readonly');
+    const req = tx.objectStore('settings').get('last_dir');
+    req.onsuccess = () => r(req.result ? req.result.handle : null);
+    req.onerror = () => r(null);
+  });
+}
+
+window.addEventListener('DOMContentLoaded', async () => {
+  try {
+    if (window.showDirectoryPicker) {
+      const handle = await getDirectoryHandle();
+      if (handle) {
+        document.getElementById('restoreBtn').style.display = 'flex';
+        const emptyRestoreBtn = document.getElementById('emptyRestoreBtn');
+        if (emptyRestoreBtn) emptyRestoreBtn.style.display = 'inline-flex';
+      }
+    }
+  } catch(e) {}
+});
+
+async function getFiles(dirHandle) {
+    const files = [];
+    async function walk(handle) {
+        for await (const entry of handle.values()) {
+            if (entry.kind === 'file') {
+                files.push(await entry.getFile());
+            } else if (entry.kind === 'directory') {
+                await walk(entry);
+            }
+        }
+    }
+    await walk(dirHandle);
+    return files;
+}
+
+async function openFolderPicker() {
+    if(!audioCtx && audioCtx?.state !== 'running') {
+        initAudioEq();
+        if(audioCtx.state === 'suspended') audioCtx.resume();
+    }
+    
+    try {
+        if (window.showDirectoryPicker) {
+            const dirHandle = await showDirectoryPicker();
+            await saveDirectoryHandle(dirHandle);
+            const files = await getFiles(dirHandle);
+            await processFiles(files);
+            document.getElementById('restoreBtn').style.display = 'flex';
+            const emptyRestoreBtn = document.getElementById('emptyRestoreBtn');
+            if (emptyRestoreBtn) emptyRestoreBtn.style.display = 'inline-flex';
+        } else {
+            document.getElementById('folderInput').click();
+        }
+    } catch(e) {}
+}
+
+async function restoreSession() {
+    if(!audioCtx && audioCtx?.state !== 'running') {
+        initAudioEq();
+        if(audioCtx.state === 'suspended') audioCtx.resume();
+    }
+    
+    const handle = await getDirectoryHandle();
+    if (!handle) return;
+    try {
+        const perm = await handle.requestPermission({ mode: 'read' });
+        if (perm !== 'granted') throw new Error('Permission non accordée');
+        const files = await getFiles(handle);
+        await processFiles(files);
+    } catch (e) {
+        notif('impossible de restaurer la session. selectionne le dossier manuellement.');
+    }
+}
+
 document.getElementById('folderInput').addEventListener('change', async e => {
   if(!audioCtx && audioCtx?.state !== 'running') {
     initAudioEq();
     if(audioCtx.state === 'suspended') audioCtx.resume();
   }
-
-  const files = Array.from(e.target.files).filter(f => f.type.startsWith('audio/') || /\.(mp3|flac|ogg|wav|aac|m4a|opus|wma)$/i.test(f.name));
-  if (!files.length) { notif('aucun fichier audio trouve'); return; }
-  showLoading(true); allTracks = [];
-  for (const file of files) {
-    const t = { file, name: file.name.replace(/\.[^.]+$/, ''), title: null, artist: null, album: null, year: null, featuring: null, duration: null, coverUrl: null, _p: false };
-    await getDuration(t); allTracks.push(t);
-  }
-  allTracks.sort((a,b) => (a.title||a.name).localeCompare(b.title||b.name));
-  showLoading(false); applyFiltersAndSearch();
-  notif(`${allTracks.length} son${allTracks.length>1?'s':''} charge${allTracks.length>1?'s':''}`);
+  const files = Array.from(e.target.files);
+  await processFiles(files);
   document.getElementById('folderInput').value = '';
-  if (jsmediatagsReady) deepParseAll();
 });
+
+async function processFiles(files) {
+    const validFiles = files.filter(f => f.type.startsWith('audio/') || /\.(mp3|flac|ogg|wav|aac|m4a|opus|wma)$/i.test(f.name));
+    if (!validFiles.length) { notif('aucun fichier audio trouve'); return; }
+    
+    showLoading(true);
+    allTracks = [];
+    const db = await dbPromise;
+    const toParse = [];
+
+    const tx = db.transaction('tracks', 'readonly');
+    const store = tx.objectStore('tracks');
+
+    const promises = validFiles.map(file => {
+       const id = file.name + '_' + file.size;
+       return new Promise(r => {
+           const req = store.get(id);
+           req.onsuccess = () => {
+               if (req.result) {
+                   const cached = req.result;
+                   const t = { file, name: file.name.replace(/\.[^.]+$/, ''), ...cached, _p: true };
+                   if (t.coverBlob) t.coverUrl = URL.createObjectURL(t.coverBlob);
+                   r({ t, cached: true });
+               } else {
+                   const t = { file, name: file.name.replace(/\.[^.]+$/, ''), title: null, artist: null, album: null, year: null, featuring: null, duration: null, coverUrl: null, coverBlob: null, _p: false };
+                   r({ t, id, cached: false });
+               }
+           };
+           req.onerror = () => {
+               const t = { file, name: file.name.replace(/\.[^.]+$/, ''), title: null, artist: null, album: null, year: null, featuring: null, duration: null, coverUrl: null, coverBlob: null, _p: false };
+               r({ t, id, cached: false });
+           };
+       });
+    });
+
+    const results = await Promise.all(promises);
+
+    for (const res of results) {
+        if (!res) continue;
+        allTracks.push(res.t);
+        if (!res.cached) toParse.push({ t: res.t, id: res.id });
+    }
+
+    allTracks.sort((a,b) => (a.title||a.name).localeCompare(b.title||b.name));
+    applyFiltersAndSearch();
+    showLoading(false);
+    notif(`${allTracks.length} son${allTracks.length>1?'s':''} charge${allTracks.length>1?'s':''}`);
+
+    if (toParse.length > 0) {
+       const check = setInterval(() => {
+          if (jsmediatagsReady) { clearInterval(check); backgroundParse(toParse); }
+       }, 500);
+    }
+}
+
+async function backgroundParse(toParse) {
+    let i = 0;
+    const db = await dbPromise;
+    for (const item of toParse) {
+        await getDuration(item.t);
+        if (jsmediatagsReady) await parseDeep(item.t);
+
+        const tx = db.transaction('tracks', 'readwrite');
+        tx.objectStore('tracks').put({
+            id: item.id,
+            duration: item.t.duration,
+            title: item.t.title,
+            artist: item.t.artist,
+            album: item.t.album,
+            year: item.t.year,
+            featuring: item.t.featuring,
+            coverBlob: item.t.coverBlob
+        });
+
+        i++;
+        if (i % 50 === 0) applyFiltersAndSearch();
+    }
+    applyFiltersAndSearch();
+    if(currentIndex >= 0) updateNowPlaying();
+}
 
 async function getDuration(track) {
   return new Promise(r => {
@@ -873,14 +1043,8 @@ async function getDuration(track) {
 let jsmediatagsReady = false;
 const sc = document.createElement('script');
 sc.src = 'https://cdnjs.cloudflare.com/ajax/libs/jsmediatags/3.9.5/jsmediatags.min.js';
-sc.onload = () => { jsmediatagsReady = true; if (allTracks.length) deepParseAll(); };
+sc.onload = () => { jsmediatagsReady = true; };
 document.head.appendChild(sc);
-
-async function deepParseAll() {
-  for (const t of allTracks) { if (!t._p) await parseDeep(t); }
-  applyFiltersAndSearch();
-  if (currentIndex >= 0) updateNowPlaying();
-}
 
 async function parseDeep(track) {
   track._p = true;
@@ -895,9 +1059,8 @@ async function parseDeep(track) {
           if (t.year) track.year = t.year;
           if (t.TPE2) track.featuring = t.TPE2.data;
           if (t.picture) {
-            const blob = new Blob([new Uint8Array(t.picture.data)], { type: t.picture.format });
-            if (track.coverUrl) URL.revokeObjectURL(track.coverUrl);
-            track.coverUrl = URL.createObjectURL(blob);
+            track.coverBlob = new Blob([new Uint8Array(t.picture.data)], { type: t.picture.format });
+            track.coverUrl = URL.createObjectURL(track.coverBlob);
           }
           r();
         },
@@ -940,7 +1103,17 @@ function applyFiltersAndSearch() {
 function renderTracklist() {
   const list = document.getElementById('tracklist');
   if (!allTracks.length) {
-    list.innerHTML = `<div class="empty-state"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg><h2>aucun son charge</h2><p>ouvre un dossier contenant tes fichiers audio pour commencer a ecouter</p><button class="brutal-btn" style="margin-top: 24px;" onclick="document.getElementById('folderInput').click()">ouvrir un dossier</button></div>`;
+    list.innerHTML = `<div class="empty-state"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg><h2>aucun son charge</h2><p>ouvre un dossier contenant tes fichiers audio pour commencer a ecouter</p><button class="brutal-btn" style="margin-top: 24px;" onclick="openFolderPicker()">ouvrir un dossier</button><button class="brutal-btn" id="emptyRestoreBtn" style="margin-top: 12px; display: none; background: var(--accent); color: var(--bg);" onclick="restoreSession()">restaurer la derniere playlist</button></div>`;
+    
+    setTimeout(async () => {
+        if (window.showDirectoryPicker) {
+          const handle = await getDirectoryHandle();
+          if (handle) {
+            const emptyRestoreBtn = document.getElementById('emptyRestoreBtn');
+            if (emptyRestoreBtn) emptyRestoreBtn.style.display = 'inline-flex';
+          }
+        }
+    }, 50);
     return;
   }
   if (!filteredTracks.length) {
@@ -1002,7 +1175,6 @@ function updateNowPlaying() {
   }
   document.getElementById('vinyl').classList.toggle('spinning', isPlaying);
   document.title = `${t.title||t.name} - sono.`;
-  if (jsmediatagsReady && !t._p) parseDeep(t).then(() => { updateNowPlaying(); renderTracklist(); });
 }
 
 function togglePlay() {
@@ -1117,9 +1289,8 @@ document.addEventListener('drop', async e => {
   }
 
   const files=Array.from(e.dataTransfer.items).filter(i=>i.kind==='file').map(i=>i.getAsFile()).filter(f=>f&&(f.type.startsWith('audio/')||/\.(mp3|flac|ogg|wav|aac|m4a|opus|wma)$/i.test(f.name)));
-  if(!files.length)return; showLoading(true);
-  for(const f of files){const t={file:f,name:f.name.replace(/\.[^.]+$/,''),title:null,artist:null,album:null,year:null,featuring:null,duration:null,coverUrl:null,_p:false};await getDuration(t);if(jsmediatagsReady)await parseDeep(t);allTracks.push(t);}
-  showLoading(false); applyFiltersAndSearch(); notif(`${files.length} son${files.length>1?'s':''} ajoute${files.length>1?'s':''}`);
+  if(!files.length)return; 
+  await processFiles(files);
 });
 </script>
 </body>
